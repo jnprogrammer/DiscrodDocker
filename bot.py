@@ -2,11 +2,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import docker
+import secrets
+from urllib.parse import urljoin
 import asyncio
-from typing import Optional
 
 from database import ContainerDB
-from config import DISCORD_TOKEN, is_authorized
+from config import DISCORD_TOKEN, TERMINAL_SERVICE_URL, is_authorized
 
 # Initialize Docker client
 docker_client = docker.from_env()
@@ -41,17 +42,17 @@ def check_authorized(interaction: discord.Interaction) -> bool:
     return True
 
 
-@bot.tree.command(name="create", description="Create a Docker container for a user")
+@bot.tree.command(name="create", description="Create a Docker container for a user: Default Ubuntu 24.04 image")
 @app_commands.describe(
     user="The Discord user to create a container for",
-    image="The Docker image to use",
-    container_name="Name for the container"
+    container_name="Name for the container",
+    image="The Docker image to use (default: ubuntu:24.04)"
 )
 async def create_container(
     interaction: discord.Interaction,
     user: discord.User,
-    image: str,
-    container_name: str
+    container_name: str,
+    image: str = "ubuntu:24.04"
 ):
     """Create a Docker container bound to a Discord user."""
     if not check_authorized(interaction):
@@ -96,9 +97,15 @@ async def create_container(
             lambda: docker_client.containers.create(
                 image=image,
                 name=container_name,
-                detach=True
+                detach=True,
+                stdin_open=True,
+                tty=True,
+                command=["tail", "-f", "/dev/null"]
             )
         )
+
+        # Ensure container is running for terminal access
+        await loop.run_in_executor(None, container.start)
 
         # Store in database
         await db.create_container_record(
@@ -322,6 +329,34 @@ async def container_status(interaction: discord.Interaction, user: discord.User)
             ephemeral=True
         )
 
+@bot.tree.command(name="terminal", description="Open a web terminal to your container")
+async def terminal(interaction: discord.Interaction):
+    if not check_authorized(interaction):
+        await interaction.response.send_message("Unauthorized.", ephemeral=True)
+        return
+
+    container = await db.get_container_by_user(str(interaction.user.id))
+    if not container:
+        await interaction.response.send_message("You have no container.", ephemeral=True)
+        return
+
+    # Generate secure one-time URL
+    token = secrets.token_urlsafe(16)
+    url = urljoin(
+        TERMINAL_SERVICE_URL.rstrip("/") + "/",
+        f"terminal/{container['container_id']}?token={token}"
+    )
+
+    await db.store_terminal_token(container['container_id'], token, expiry=3600)
+
+    embed = discord.Embed(title="Web Terminal", color=0x00ff00)
+    embed.add_field(name="Container", value=container['container_name'], inline=False)
+    embed.add_field(name="Click to Open", value=f"[Open Terminal]({url})", inline=False)
+
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Open Terminal", url=url))
+
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
